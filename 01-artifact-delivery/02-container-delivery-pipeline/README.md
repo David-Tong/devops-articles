@@ -74,9 +74,11 @@ flowchart LR
 
     并行 -->|"编译打包"| B["构建 JAR\n~3-5 min"]
     并行 -->|"SAST 安全扫描"| SA["安全扫描\n~1-2 min"]
+    并行 --> SCA["SCA 软件成分分析\n依赖漏洞与许可证检查"]
 
     B --> IMG["构建容器镜像\nDocker build\n~2-3 min"]
     SA --> IMG
+    SCA --> IMG
 
     IMG --> SCAN["镜像漏洞扫描\nTrivy / Grype\n~1-2 min"]
     SCAN --> PUSH["推送镜像仓库\n标签: main-{commit-sha}\n~1 min"]
@@ -84,6 +86,8 @@ flowchart LR
     PUSH --> DEV["部署到开发环境\nkubectl / Helm\n~2 min"]
     DEV --> IT["集成测试\n~5-10 min"]
     IT --> STG["部署到 Staging\n~2 min"]
+    STG --> DAST["DAST 动态应用安全测试\n服务就绪后执行快速扫描"]
+    DAST --> READY["安全门禁通过\n标记为可选发布版本"]
 
     style A fill:#2d6a4f,color:#fff
     style PUSH fill:#1d3557,color:#fff
@@ -96,12 +100,20 @@ flowchart LR
 |------|------|----------|
 | **构建 JAR** | 编译源码，运行单元测试 | 失败则整条流水线终止 |
 | **安全扫描（SAST）** | 静态代码安全分析，与编译并行 | 高危漏洞应阻断流水线 |
+| **SCA（软件成分分析）** | 检查直接及传递依赖的已知漏洞与许可证风险 | 违反准入策略则阻断镜像构建 |
 | **构建容器镜像** | 执行 Dockerfile，将 JAR 打包进基础镜像 | 镜像分层设计影响构建速度和镜像体积 |
 | **镜像漏洞扫描** | 扫描镜像中的 OS 包和依赖库漏洞（Trivy / Grype） | 区分镜像漏洞与代码漏洞，分别治理 |
 | **推送镜像仓库** | 将镜像推送至 ECR / Harbor / Artifactory | 标签策略决定回滚能力 |
 | **部署到开发环境** | 更新 Kubernetes Deployment 的镜像版本 | kubectl set image 或 Helm upgrade |
 | **集成测试** | 在真实 K8s 环境中验证服务间协作 | 失败则 Staging 不会收到新版本 |
-| **部署到 Staging** | 晋级到与生产同构的预发环境 | 是生产发布的最后一道门禁 |
+| **部署到 Staging** | 晋级到与生产同构的预发环境 | 确认服务就绪，供后续动态安全测试使用 |
+| **DAST（动态应用安全测试）** | 对 Staging 的关键 Web / API 路径执行限时快速扫描 | 扫描成功且无阻断项后，才可标记为可选发布版本 |
+
+### 安全测试如何配合
+
+**SAST（静态应用安全测试）** 检查代码中的潜在安全缺陷，**SCA（软件成分分析）** 检查第三方组件的已知漏洞与许可证风险，**DAST（动态应用安全测试）** 检查运行中的应用或 API。三者的原理、优点与局限，见上一篇的[安全测试：SAST、DAST 与 SCA](../01-release-pipeline-overview/README.md#安全测试sastdast-与-sca)。
+
+在本篇的容器流水线中，**SAST** 和 **SCA** 在构建阶段执行，镜像构建后继续检查实际交付的 OS 包和应用依赖漏洞。**DAST** 在主干的 Staging 部署完成后执行快速扫描，在发布流水线中对选定版本执行更完整的认证扫描。现有的集成测试不能替代 **DAST**，而镜像扫描也不能替代代码安全分析。
 
 ### 镜像标签策略
 
@@ -124,12 +136,25 @@ flowchart LR
     B --> C["重新打标签\nv1.4.2"]
     C --> D["推送至\n生产镜像仓库"]
     D --> E["生成 Release Notes"]
-    E --> F["触发生产部署\nkubectl / Helm / Argo CD"]
+    E --> STG["选定发布镜像部署到 Staging\n按 digest 固定版本并检查服务就绪"]
+    STG --> DAST["DAST 动态应用安全测试\n完整认证扫描 / 多角色 / Web 与 API"]
+    DAST --> GATE["安全门禁通过\n扫描完成且无阻断项"]
+    GATE --> F["触发生产部署\n使用已验证的同一镜像 digest\nkubectl / Helm / Argo CD"]
 
     style A fill:#9b2226,color:#fff
     style D fill:#1d3557,color:#fff
     style F fill:#457b9d,color:#fff
 ```
+
+### 发布安全门禁
+
+| 步骤 | 说明 | 阻断条件 |
+|------|------|------|
+| **部署选定版本到 Staging** | 使用本次 Release 对应的镜像 digest，固定扫描期间的版本并确认服务就绪 | 版本不匹配或服务不可用 |
+| **DAST（动态应用安全测试）** | 使用专用测试账号和数据执行完整认证扫描，覆盖多角色会话及 Web / API；报告关联镜像 digest | 达到阻断阈值的漏洞（例如高危或严重漏洞）、扫描失败、超时或登录失败 |
+| **生产部署** | 仅在发布 **DAST** 通过后，部署同一 digest 的镜像 | 发布安全门禁未通过 |
+
+主干 **DAST** 用于快速反馈，发布 **DAST** 用于对选定制品做更完整的上线前检查。主干快速扫描同样会因达到阻断阈值的漏洞或扫描未成功完成而失败。推送生产镜像仓库不代表已获准部署；生产部署必须等待安全门禁通过。
 
 ### 生产部署策略
 
